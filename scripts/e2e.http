@@ -1,0 +1,53 @@
+### Send SMS (mock logs code)
+POST http://localhost:8000/api/v1/auth/sms/send
+Content-Type: application/json
+
+{
+  "phone": "+8613711112222"
+}
+
+### Verify SMS (replace code from logs)
+POST http://localhost:8000/api/v1/auth/sms/verify
+Content-Type: application/json
+
+{
+  "phone": "+8613711112222",
+  "code": "123456"
+}
+
+### Create collection
+POST http://localhost:8000/api/v1/collections
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "name": "My Collection"
+}
+
+### Create problem
+POST http://localhost:8000/api/v1/problems
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "collection_id": "{{collection_id}}",
+  "original_image_url": "https://example.com/image.png"
+}
+
+### Trigger OCR
+POST http://localhost:8000/api/v1/problems/{{problem_id}}/ocr
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "idempotency_key": "ocr-1"
+}
+
+### Export PDF
+POST http://localhost:8000/api/v1/collections/{{collection_id}}/export_pdf
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "idempotency_key": "pdf-1"
+}
