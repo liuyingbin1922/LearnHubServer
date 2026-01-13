@@ -1,9 +1,8 @@
-import hashlib
 import logging
 import os
 import secrets
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -14,21 +13,13 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from shared.auth import (
-    AuthError,
-    create_access_token,
-    create_refresh_token,
-    decode_access_token,
-    get_user,
-    revoke_refresh_token,
-    rotate_refresh_token,
-)
+from services.api.deps.auth import get_current_user_id, require_auth
+from services.api.deps.db import get_db
+from services.api.middleware.auth import AuthMiddleware
 from shared.celery_app import celery_app
 from shared.config import get_settings
-from shared.db import get_session_factory
 from shared.logging import configure_logging
-from shared.models import AuthIdentity, Collection, Job, Problem, SmsOtp, User
-from shared.redis import get_redis
+from shared.models import Collection, Job, Problem, User
 from shared.schemas import (
     CollectionCreateRequest,
     CollectionUpdateRequest,
@@ -52,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 settings = get_settings()
-SessionLocal = get_session_factory()
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +51,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuthMiddleware)
 
 ensure_storage_root()
 app.mount("/media", StaticFiles(directory=settings.storage_root), name="media")
@@ -90,27 +81,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return api_response(request, data={"errors": exc.errors()}, code=400, message="validation_error")
 
 
-def get_db():
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
-    auth_header = request.headers.get("authorization")
-    if not auth_header:
-        raise HTTPException(status_code=401, detail="missing token")
-    token = auth_header.replace("Bearer ", "")
-    try:
-        user_id = decode_access_token(token)
-    except AuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    user = get_user(db, user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="user not found")
-    return user
+def deprecated_auth_response(request: Request):
+    return api_response(request, data=None, code=410, message="Auth handled by Better Auth; use /api/auth")
 
 
 @app.get("/healthz")
@@ -119,189 +91,73 @@ def healthz(request: Request):
 
 
 @app.post("/api/v1/auth/sms/send")
-def sms_send(request: Request, body: SmsSendRequest, db: Session = Depends(get_db)):
-    redis_client = get_redis()
-    phone_key = f"sms:phone:{body.phone}"
-    ip = request.client.host if request.client else "unknown"
-    ip_key = f"sms:ip:{ip}:{datetime.utcnow().strftime('%Y%m%d%H')}"
-
-    if redis_client.get(phone_key):
-        raise HTTPException(status_code=429, detail="rate limit")
-    if redis_client.incr(ip_key) > settings.sms_ip_rate_limit_per_hour:
-        raise HTTPException(status_code=429, detail="rate limit")
-    redis_client.expire(ip_key, 3600)
-
-    code = "".join([str(secrets.randbelow(10)) for _ in range(6)])
-    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-    expires_at = datetime.utcnow() + timedelta(seconds=settings.sms_code_expire_seconds)
-    otp = SmsOtp(phone=body.phone, code_hash=code_hash, expires_at=expires_at, ip=ip)
-    db.add(otp)
-    db.commit()
-
-    redis_client.setex(phone_key, settings.sms_phone_rate_limit_seconds, "1")
-    logger.info("mock sms send", extra={"phone": body.phone, "code": code})
-    return api_response(request, data={"sent": True})
-
-
-def _verify_sms_code(db: Session, phone: str, code: str) -> Optional[SmsOtp]:
-    redis_client = get_redis()
-    otp = (
-        db.query(SmsOtp)
-        .filter(SmsOtp.phone == phone, SmsOtp.consumed_at.is_(None))
-        .order_by(SmsOtp.created_at.desc())
-        .first()
-    )
-    if not otp:
-        return None
-    if otp.expires_at < datetime.utcnow():
-        return None
-    attempt_key = f"sms:attempt:{otp.id}"
-    attempts = int(redis_client.get(attempt_key) or 0)
-    if attempts >= 5:
-        return None
-    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-    if otp.code_hash != code_hash:
-        redis_client.incr(attempt_key)
-        redis_client.expire(attempt_key, settings.sms_code_expire_seconds)
-        return None
-    otp.consumed_at = datetime.utcnow()
-    db.add(otp)
-    db.commit()
-    redis_client.delete(attempt_key)
-    return otp
-
-
-def _get_or_create_user_for_phone(db: Session, phone: str) -> User:
-    identity = (
-        db.query(AuthIdentity)
-        .filter(AuthIdentity.provider == "phone", AuthIdentity.provider_uid == phone)
-        .first()
-    )
-    if identity:
-        return db.query(User).filter(User.id == identity.user_id).first()
-    user = User()
-    db.add(user)
-    db.commit()
-    identity = AuthIdentity(user_id=user.id, provider="phone", provider_uid=phone)
-    db.add(identity)
-    db.commit()
-    return user
-
-
-def _tokens_for_user(db: Session, user: User) -> Dict[str, Any]:
-    access_token = create_access_token(str(user.id))
-    refresh_token = create_refresh_token(db, str(user.id))
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "user": {"id": str(user.id), "nickname": user.nickname, "avatar_url": user.avatar_url},
-    }
+def sms_send(request: Request, body: SmsSendRequest):
+    return deprecated_auth_response(request)
 
 
 @app.post("/api/v1/auth/sms/verify")
-def sms_verify(request: Request, body: SmsVerifyRequest, db: Session = Depends(get_db)):
-    otp = _verify_sms_code(db, body.phone, body.code)
-    if not otp:
-        raise HTTPException(status_code=400, detail="invalid code")
-    user = _get_or_create_user_for_phone(db, body.phone)
-    return api_response(request, data=_tokens_for_user(db, user))
+def sms_verify(request: Request, body: SmsVerifyRequest):
+    return deprecated_auth_response(request)
 
 
 @app.post("/api/v1/auth/refresh")
-def refresh_token(request: Request, body: RefreshRequest, db: Session = Depends(get_db)):
-    result = rotate_refresh_token(db, body.refresh_token)
-    if not result:
-        raise HTTPException(status_code=401, detail="invalid refresh token")
-    new_token, user_id = result
-    access_token = create_access_token(user_id)
-    return api_response(request, data={"access_token": access_token, "refresh_token": new_token})
+def refresh_token(request: Request, body: RefreshRequest):
+    return deprecated_auth_response(request)
 
 
 @app.post("/api/v1/auth/logout")
-def logout(request: Request, body: LogoutRequest, db: Session = Depends(get_db)):
-    revoke_refresh_token(db, body.refresh_token)
-    return api_response(request, data={"revoked": True})
+def logout(request: Request, body: LogoutRequest):
+    return deprecated_auth_response(request)
 
 
 @app.get("/api/v1/me")
-def me(request: Request, user: User = Depends(get_current_user)):
-    return api_response(request, data={"id": str(user.id), "nickname": user.nickname, "avatar_url": user.avatar_url})
+def me(request: Request, user_id: str = Depends(require_auth), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == UUID(user_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="not found")
+    claims = getattr(request.state, "claims", {})
+    return api_response(
+        request,
+        data={
+            "id": str(user.id),
+            "nickname": user.nickname,
+            "avatar_url": user.avatar_url,
+            "email": claims.get("email"),
+        },
+    )
 
 
 @app.get("/api/v1/auth/wechat/web/authorize")
 def wechat_authorize(request: Request):
-    state = secrets.token_urlsafe(16)
-    redis_client = get_redis()
-    redis_client.setex(f"wechat_state:{state}", 300, "1")
-    redirect_url = (
-        "https://open.weixin.qq.com/connect/qrconnect"
-        f"?appid={settings.wechat_app_id}&redirect_uri=http://localhost:8000/api/v1/auth/wechat/web/callback"
-        f"&response_type=code&scope=snsapi_login&state={state}#wechat_redirect"
-    )
-    return JSONResponse(status_code=302, headers={"Location": redirect_url})
+    return deprecated_auth_response(request)
 
 
 @app.get("/api/v1/auth/wechat/web/callback")
-def wechat_callback(request: Request, code: str, state: str, db: Session = Depends(get_db)):
-    redis_client = get_redis()
-    if not redis_client.get(f"wechat_state:{state}"):
-        raise HTTPException(status_code=400, detail="invalid state")
-    redis_client.delete(f"wechat_state:{state}")
-
-    if settings.wechat_mock:
-        provider_uid = f"mock-{code}"
-        union_id = None
-    else:
-        provider_uid = f"wechat-{code}"
-        union_id = None
-
-    identity = (
-        db.query(AuthIdentity)
-        .filter(AuthIdentity.provider == "wechat_web", AuthIdentity.provider_uid == provider_uid)
-        .first()
-    )
-    if identity:
-        user = db.query(User).filter(User.id == identity.user_id).first()
-    else:
-        user = User()
-        db.add(user)
-        db.commit()
-        identity = AuthIdentity(user_id=user.id, provider="wechat_web", provider_uid=provider_uid, union_id=union_id)
-        db.add(identity)
-        db.commit()
-
-    one_time_code = secrets.token_urlsafe(16)
-    redis_client.setex(f"wechat_exchange:{one_time_code}", 300, str(user.id))
-    redirect_url = f"{settings.frontend_auth_callback_url}?code={one_time_code}"
-    return JSONResponse(status_code=302, headers={"Location": redirect_url})
+def wechat_callback(request: Request, code: str, state: str):
+    return deprecated_auth_response(request)
 
 
 @app.post("/api/v1/auth/exchange")
-def wechat_exchange(request: Request, body: WechatExchangeRequest, db: Session = Depends(get_db)):
-    redis_client = get_redis()
-    user_id = redis_client.get(f"wechat_exchange:{body.one_time_code}")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="invalid code")
-    redis_client.delete(f"wechat_exchange:{body.one_time_code}")
-    user = db.query(User).filter(User.id == UUID(user_id)).first()
-    if not user:
-        raise HTTPException(status_code=400, detail="user not found")
-    return api_response(request, data=_tokens_for_user(db, user))
+def wechat_exchange(request: Request, body: WechatExchangeRequest):
+    return deprecated_auth_response(request)
 
 
 @app.post("/api/v1/collections")
 def create_collection(
-    request: Request, body: CollectionCreateRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request,
+    body: CollectionCreateRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_auth),
 ):
-    collection = Collection(user_id=user.id, name=body.name)
+    collection = Collection(user_id=UUID(user_id), name=body.name)
     db.add(collection)
     db.commit()
     return api_response(request, data={"id": str(collection.id), "name": collection.name})
 
 
 @app.get("/api/v1/collections")
-def list_collections(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    collections = db.query(Collection).filter(Collection.user_id == user.id).all()
+def list_collections(request: Request, db: Session = Depends(get_db), user_id: str = Depends(require_auth)):
+    collections = db.query(Collection).filter(Collection.user_id == UUID(user_id)).all()
     collection_ids = [c.id for c in collections]
     counts = (
         db.query(Problem.collection_id, func.count(Problem.id))
@@ -319,11 +175,14 @@ def list_collections(request: Request, db: Session = Depends(get_db), user: User
 
 @app.get("/api/v1/collections/{collection_id}")
 def get_collection(
-    request: Request, collection_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request,
+    collection_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_auth),
 ):
     collection = (
         db.query(Collection)
-        .filter(Collection.id == collection_id, Collection.user_id == user.id)
+        .filter(Collection.id == collection_id, Collection.user_id == UUID(user_id))
         .first()
     )
     if not collection:
@@ -337,11 +196,11 @@ def update_collection(
     collection_id: str,
     body: CollectionUpdateRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user_id: str = Depends(require_auth),
 ):
     collection = (
         db.query(Collection)
-        .filter(Collection.id == collection_id, Collection.user_id == user.id)
+        .filter(Collection.id == collection_id, Collection.user_id == UUID(user_id))
         .first()
     )
     if not collection:
@@ -356,11 +215,11 @@ def update_collection(
 
 @app.delete("/api/v1/collections/{collection_id}")
 def delete_collection(
-    request: Request, collection_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request, collection_id: str, db: Session = Depends(get_db), user_id: str = Depends(require_auth)
 ):
     collection = (
         db.query(Collection)
-        .filter(Collection.id == collection_id, Collection.user_id == user.id)
+        .filter(Collection.id == collection_id, Collection.user_id == UUID(user_id))
         .first()
     )
     if not collection:
@@ -372,9 +231,9 @@ def delete_collection(
 
 @app.post("/api/v1/uploads/presign")
 def upload_presign(
-    request: Request, body: UploadPresignRequest, user: User = Depends(get_current_user)
+    request: Request, body: UploadPresignRequest, user_id: str = Depends(require_auth)
 ):
-    data = build_presign_response(str(user.id), body.filename)
+    data = build_presign_response(user_id, body.filename)
     return api_response(request, data=data)
 
 
@@ -383,9 +242,9 @@ def upload_direct(
     request: Request,
     object_key: str = Query(...),
     file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
+    user_id: str = Depends(require_auth),
 ):
-    if not object_key.startswith(f"user/{user.id}/"):
+    if not object_key.startswith(f"user/{user_id}/"):
         raise HTTPException(status_code=403, detail="invalid object key")
     local_path = get_local_path(object_key)
     os_dir = local_path.rsplit("/", 1)[0]
@@ -397,26 +256,29 @@ def upload_direct(
 
 @app.post("/api/v1/uploads/complete")
 def upload_complete(
-    request: Request, body: UploadCompleteRequest, user: User = Depends(get_current_user)
+    request: Request, body: UploadCompleteRequest, user_id: str = Depends(require_auth)
 ):
-    if not body.object_key.startswith(f"user/{user.id}/"):
+    if not body.object_key.startswith(f"user/{user_id}/"):
         raise HTTPException(status_code=403, detail="invalid object key")
     return api_response(request, data={"url": get_public_url(body.object_key)})
 
 
 @app.post("/api/v1/problems")
 def create_problem(
-    request: Request, body: ProblemCreateRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request,
+    body: ProblemCreateRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_auth),
 ):
     collection = (
         db.query(Collection)
-        .filter(Collection.id == body.collection_id, Collection.user_id == user.id)
+        .filter(Collection.id == body.collection_id, Collection.user_id == UUID(user_id))
         .first()
     )
     if not collection:
         raise HTTPException(status_code=404, detail="collection not found")
     problem = Problem(
-        user_id=user.id,
+        user_id=UUID(user_id),
         collection_id=collection.id,
         status="DRAFT",
         original_image_url=body.original_image_url,
@@ -436,10 +298,10 @@ def list_problems(
     offset: int = Query(0, ge=0),
     updated_after: Optional[str] = None,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user_id: str = Depends(require_auth),
 ):
     query = db.query(Problem).filter(
-        Problem.collection_id == collection_id, Problem.user_id == user.id
+        Problem.collection_id == collection_id, Problem.user_id == UUID(user_id)
     )
     if updated_after:
         query = query.filter(Problem.updated_at > datetime.fromisoformat(updated_after))
@@ -463,9 +325,9 @@ def list_problems(
 
 @app.get("/api/v1/problems/{problem_id}")
 def get_problem(
-    request: Request, problem_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request, problem_id: str, db: Session = Depends(get_db), user_id: str = Depends(require_auth)
 ):
-    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == user.id).first()
+    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == UUID(user_id)).first()
     if not problem:
         raise HTTPException(status_code=404, detail="not found")
     data = {
@@ -488,9 +350,9 @@ def update_problem(
     problem_id: str,
     body: ProblemUpdateRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user_id: str = Depends(require_auth),
 ):
-    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == user.id).first()
+    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == UUID(user_id)).first()
     if not problem:
         raise HTTPException(status_code=404, detail="not found")
     if problem.version != body.version:
@@ -498,7 +360,7 @@ def update_problem(
     if body.collection_id:
         collection = (
             db.query(Collection)
-            .filter(Collection.id == body.collection_id, Collection.user_id == user.id)
+            .filter(Collection.id == body.collection_id, Collection.user_id == UUID(user_id))
             .first()
         )
         if not collection:
@@ -521,9 +383,9 @@ def update_problem(
 
 @app.delete("/api/v1/problems/{problem_id}")
 def delete_problem(
-    request: Request, problem_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request, problem_id: str, db: Session = Depends(get_db), user_id: str = Depends(require_auth)
 ):
-    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == user.id).first()
+    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == UUID(user_id)).first()
     if not problem:
         raise HTTPException(status_code=404, detail="not found")
     db.delete(problem)
@@ -533,9 +395,9 @@ def delete_problem(
 
 @app.get("/api/v1/jobs/{job_id}")
 def get_job(
-    request: Request, job_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    request: Request, job_id: str, db: Session = Depends(get_db), user_id: str = Depends(require_auth)
 ):
-    job = db.query(Job).filter(Job.id == job_id, Job.user_id == user.id).first()
+    job = db.query(Job).filter(Job.id == job_id, Job.user_id == UUID(user_id)).first()
     if not job:
         raise HTTPException(status_code=404, detail="not found")
     data = {"status": job.status, "result": job.result, "error_message": job.error_message}
@@ -548,9 +410,9 @@ def trigger_ocr(
     problem_id: str,
     body: OcrRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user_id: str = Depends(require_auth),
 ):
-    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == user.id).first()
+    problem = db.query(Problem).filter(Problem.id == problem_id, Problem.user_id == UUID(user_id)).first()
     if not problem:
         raise HTTPException(status_code=404, detail="not found")
     job = None
@@ -558,7 +420,7 @@ def trigger_ocr(
         job = (
             db.query(Job)
             .filter(
-                Job.user_id == user.id,
+                Job.user_id == UUID(user_id),
                 Job.type == "OCR",
                 Job.idempotency_key == body.idempotency_key,
             )
@@ -566,7 +428,7 @@ def trigger_ocr(
         )
     if not job:
         job = Job(
-            user_id=user.id,
+            user_id=UUID(user_id),
             type="OCR",
             status="PENDING",
             target_id=problem.id,
@@ -590,11 +452,11 @@ def export_pdf(
     collection_id: str,
     body: ExportPdfRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user_id: str = Depends(require_auth),
 ):
     collection = (
         db.query(Collection)
-        .filter(Collection.id == collection_id, Collection.user_id == user.id)
+        .filter(Collection.id == collection_id, Collection.user_id == UUID(user_id))
         .first()
     )
     if not collection:
@@ -604,7 +466,7 @@ def export_pdf(
         job = (
             db.query(Job)
             .filter(
-                Job.user_id == user.id,
+                Job.user_id == UUID(user_id),
                 Job.type == "PDF_EXPORT",
                 Job.idempotency_key == body.idempotency_key,
             )
@@ -612,7 +474,7 @@ def export_pdf(
         )
     if not job:
         job = Job(
-            user_id=user.id,
+            user_id=UUID(user_id),
             type="PDF_EXPORT",
             status="PENDING",
             target_id=collection.id,

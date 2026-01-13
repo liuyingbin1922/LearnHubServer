@@ -1,19 +1,6 @@
-### Send SMS (mock logs code)
-POST http://localhost:8000/api/v1/auth/sms/send
-Content-Type: application/json
-
-{
-  "phone": "+8613711112222"
-}
-
-### Verify SMS (replace code from logs)
-POST http://localhost:8000/api/v1/auth/sms/verify
-Content-Type: application/json
-
-{
-  "phone": "+8613711112222",
-  "code": "123456"
-}
+### Get profile (requires Better Auth token)
+GET http://localhost:8000/api/v1/me
+Authorization: Bearer {{access_token}}
 
 ### Create collection
 POST http://localhost:8000/api/v1/collections

@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     wechat_app_secret: str = "mock-app-secret"
     wechat_mock: bool = True
     frontend_auth_callback_url: str = "http://localhost:3000/auth/callback"
+    better_auth_jwks_url: str = "http://localhost:3000/api/auth/jwks"
+    better_auth_issuer: str = "http://localhost:3000"
+    better_auth_audience: str | None = None
+    better_auth_jwks_cache_ttl_seconds: int = 21600
+    auth_dev_bypass: bool = False
+    auth_dev_user_sub: str = "dev-user"
+    auth_provider_name: str = "better_auth"
     storage_root: str = "/data/storage"
     public_base_url: str = "http://localhost:8000/media"
 

@@ -23,6 +23,9 @@ services:
       LEARNHUB_REDIS_URL: redis://redis:6379/0
       LEARNHUB_JWT_SECRET: dev-secret
       LEARNHUB_PUBLIC_BASE_URL: http://localhost:8000/media
+      LEARNHUB_BETTER_AUTH_JWKS_URL: http://localhost:3000/api/auth/jwks
+      LEARNHUB_BETTER_AUTH_ISSUER: http://localhost:3000
+      LEARNHUB_AUTH_DEV_BYPASS: "true"
     volumes:
       - ../:/app
       - storage_data:/data/storage
